@@ -1043,8 +1043,13 @@ struct DrawInputs {
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
     std::vector<std::uint32_t> restartTable;
+    std::uint32_t expandedIndexCount = 0;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
+
+bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
+    return state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && BarycentricPatches(state, shaders);
+}
 
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
     auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -1129,19 +1134,58 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     ValidateSampleMask(context, state, shaders);
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    if (state.quadList) {
-        Require(!draw.indirect, "indirect quad-list draw is unsupported");
-        const std::uint32_t quadCount = draw.indexCount / 4u;
-        if (quadCount == 0u || draw.instanceCount == 0u) {
+    if (state.quadList || StripPatches(state, shaders)) {
+        Require(!draw.indirect, state.quadList ? "indirect quad-list draw is unsupported" : "an indirect triangle strip through emulated barycentric patches is unsupported");
+        const std::uint32_t primitives = state.quadList ? draw.indexCount / 4u : draw.indexCount >= 3u ? draw.indexCount - 2u : 0u;
+        if (primitives == 0u || draw.instanceCount == 0u) {
             inputs.nothing = true;
             return inputs;
         }
-        const std::uint32_t outputIndexCount = quadCount * 6u;
-        const std::size_t quadIndexBytes = static_cast<std::size_t>(outputIndexCount) * sizeof(std::uint32_t);
-        auto indexCopy = std::make_shared<Buffer>(context, quadIndexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        const std::uint32_t corners = state.quadList ? 6u : 3u;
+        const std::uint32_t outputIndexCount = primitives * corners;
+        const std::size_t expandedIndexBytes = static_cast<std::size_t>(outputIndexCount) * sizeof(std::uint32_t);
+        auto indexCopy = std::make_shared<Buffer>(context, expandedIndexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         auto* outIndices = reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data());
         std::uint32_t maxIdx = 0;
         const bool lastProvoking = state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+        const auto expand = [&](const auto& source) {
+            for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
+                auto* out = outIndices + static_cast<std::size_t>(primitive) * corners;
+                if (state.quadList) {
+                    const auto i0 = source(primitive * 4u + 0u);
+                    const auto i1 = source(primitive * 4u + 1u);
+                    const auto i2 = source(primitive * 4u + 2u);
+                    const auto i3 = source(primitive * 4u + 3u);
+                    if (lastProvoking) {
+                        out[0] = i0;
+                        out[1] = i1;
+                        out[2] = i3;
+                        out[3] = i1;
+                        out[4] = i2;
+                        out[5] = i3;
+                    } else {
+                        out[0] = i0;
+                        out[1] = i1;
+                        out[2] = i2;
+                        out[3] = i0;
+                        out[4] = i2;
+                        out[5] = i3;
+                    }
+                } else {
+                    const std::uint32_t odd = primitive & 1u;
+                    if (lastProvoking) {
+                        out[0] = source(primitive + odd);
+                        out[1] = source(primitive + 1u - odd);
+                        out[2] = source(primitive + 2u);
+                    } else {
+                        out[0] = source(primitive);
+                        out[1] = source(primitive + 1u + odd);
+                        out[2] = source(primitive + 2u - odd);
+                    }
+                }
+                for (std::uint32_t corner = 0; corner < corners; ++corner) maxIdx = std::max(maxIdx, out[corner]);
+            }
+        };
         if (draw.indexed) {
             GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
             GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
@@ -1156,59 +1200,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                     return v;
                 }
             };
-            for (std::uint32_t q = 0; q < quadCount; ++q) {
-                const auto i0 = readIndex(q * 4u + 0u);
-                const auto i1 = readIndex(q * 4u + 1u);
-                const auto i2 = readIndex(q * 4u + 2u);
-                const auto i3 = readIndex(q * 4u + 3u);
-                maxIdx = std::max({maxIdx, i0, i1, i2, i3});
-                if (lastProvoking) {
-                    outIndices[q * 6u + 0u] = i0;
-                    outIndices[q * 6u + 1u] = i1;
-                    outIndices[q * 6u + 2u] = i3;
-                    outIndices[q * 6u + 3u] = i1;
-                    outIndices[q * 6u + 4u] = i2;
-                    outIndices[q * 6u + 5u] = i3;
-                } else {
-                    outIndices[q * 6u + 0u] = i0;
-                    outIndices[q * 6u + 1u] = i1;
-                    outIndices[q * 6u + 2u] = i2;
-                    outIndices[q * 6u + 3u] = i0;
-                    outIndices[q * 6u + 4u] = i2;
-                    outIndices[q * 6u + 5u] = i3;
-                }
-            }
+            expand(readIndex);
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
-            inputs.maxIndex = maxIdx + draw.firstVertex;
         } else {
-            maxIdx = quadCount * 4u - 1u;
-            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "auto draw vertex range overflow");
-            for (std::uint32_t q = 0; q < quadCount; ++q) {
-                const auto i0 = q * 4u + 0u;
-                const auto i1 = q * 4u + 1u;
-                const auto i2 = q * 4u + 2u;
-                const auto i3 = q * 4u + 3u;
-                if (lastProvoking) {
-                    outIndices[q * 6u + 0u] = i0;
-                    outIndices[q * 6u + 1u] = i1;
-                    outIndices[q * 6u + 2u] = i3;
-                    outIndices[q * 6u + 3u] = i1;
-                    outIndices[q * 6u + 4u] = i2;
-                    outIndices[q * 6u + 5u] = i3;
-                } else {
-                    outIndices[q * 6u + 0u] = i0;
-                    outIndices[q * 6u + 1u] = i1;
-                    outIndices[q * 6u + 2u] = i2;
-                    outIndices[q * 6u + 3u] = i0;
-                    outIndices[q * 6u + 4u] = i2;
-                    outIndices[q * 6u + 5u] = i3;
-                }
-            }
-            inputs.maxIndex = maxIdx + draw.firstVertex;
+            const std::uint32_t lastVertex = state.quadList ? primitives * 4u - 1u : primitives + 1u;
+            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
+            expand([](std::uint32_t idx) { return idx; });
         }
+        inputs.maxIndex = maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.indexHandle = indexCopy->Handle();
         inputs.indexOffset = 0;
+        inputs.expandedIndexCount = outputIndexCount;
         inputs.indices = std::move(indexCopy);
     } else if (draw.indexed) {
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1491,9 +1494,9 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         return;
     }
     if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (state.quadList) {
+    if (inputs.expandedIndexCount != 0u) {
         context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, VK_INDEX_TYPE_UINT32);
-        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, (draw.indexCount / 4u) * 6u, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         return;
     }
     if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -2230,7 +2233,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
         recipeOut = nullptr;
     }
-    if (state.quadList) recipeOut = nullptr;
+    if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2955,7 +2958,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
-    if (state.quadList || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
+    if (state.quadList || StripPatches(state, shaders) || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");

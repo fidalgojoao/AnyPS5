@@ -224,13 +224,17 @@ Driver::Driver() {
 
 void Driver::WaitIdle() {
     require(!onWorkerThread(), "worker cannot wait for itself");
-    std::unique_lock lock(mutex);
-    const auto target = accepted;
-    ++idleWaiters;
-    changed.wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
-    --idleWaiters;
-    rethrowFailure();
-    checkStopping();
+    {
+        std::unique_lock lock(mutex);
+        const auto target = accepted;
+        ++idleWaiters;
+        changed.wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
+        --idleWaiters;
+        rethrowFailure();
+        checkStopping();
+    }
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) localDevice->WaitIdle();
 }
 
 void Driver::CheckFailure() {
