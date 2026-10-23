@@ -290,7 +290,12 @@ std::int64_t APS5_VABI imaxabs_nid_postfix(std::int64_t x) {
     return labs_nid_postfix(x);
 }
 
-float APS5_VABI fmodf_nid_postfix(float x, float y) { return std::fmod(x, y); }
+float APS5_VABI fmodf_nid_postfix(float x, float y) {
+    const int saved_errno = errno;
+    const float result = std::fmod(x, y);
+    errno = saved_errno;
+    return result;
+}
 float APS5_VABI asinf_nid_postfix(float x) {
     const int saved_errno = errno;
     const float result = std::asin(x);
@@ -748,6 +753,26 @@ int APS5_VABI __fpclassifyd_nid_postfix(double value) {
 
 double APS5_VABI _Sinh_nid_postfix(double x, double y) {
     return SonySinh(x, y);
+}
+
+double APS5_VABI _Cosh_nid_postfix(double x, double y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) return y * std::cosh(x);
+    if (y == 0.0) return std::copysign(0.0, y);
+    constexpr double Ln2High = 0x1.62e42fefa0000p-1;
+    constexpr double Ln2Low = 0x1.cf79abc9e3b3ap-40;
+    constexpr double InverseLn2 = 0x1.71547652b82fep+0;
+    const double magnitude = std::abs(x);
+    if (magnitude <= (std::numeric_limits<double>::max_exponent - 1) * (Ln2High + Ln2Low))
+        return y * std::cosh(x);
+    int scaleExponent;
+    const double scale = std::frexp(y, &scaleExponent);
+    constexpr int MaximumExponentSpan = std::numeric_limits<double>::max_exponent -
+        std::numeric_limits<double>::min_exponent + std::numeric_limits<double>::digits + 4;
+    if (magnitude > MaximumExponentSpan * (Ln2High + Ln2Low))
+        return std::scalbn(scale, INT_MAX);
+    const int exponent = static_cast<int>(magnitude * InverseLn2);
+    const double reduced = std::fma(-exponent, Ln2Low, std::fma(-exponent, Ln2High, magnitude));
+    return std::scalbn(scale * (0.5 * std::exp(reduced)), scaleExponent + exponent);
 }
 
 int APS5_VABI _Fltrounds_nid_postfix(void) {

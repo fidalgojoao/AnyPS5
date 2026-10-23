@@ -53,6 +53,8 @@ struct Module {
     bool layerOutput = false;
     bool meshCapability = false;
     std::uint32_t primitiveInputs = 0;
+    bool pointSizeOutput = false;
+    bool pointSize = false;
     std::map<std::uint32_t, std::vector<std::uint32_t>> modes;
 
     const std::vector<std::uint32_t>& Type(std::uint32_t id) const {
@@ -138,6 +140,10 @@ struct Module {
                 Require(input && (clipInput || (value == spv::BuiltInPosition && signature == "f32x4") || (value == spv::BuiltInTessCoord && stage == Stage::TessellationEvaluation && signature == "f32x3") || ((value == spv::BuiltInInvocationId || value == spv::BuiltInPrimitiveId || value == spv::BuiltInPatchVertices) && (signature == "i32" || signature == "u32"))), "unsupported tessellation built-in");
                 return;
             }
+            if (!input && value == spv::BuiltInPointSize && pointSizeOutput && signature == "f32" && !pointSize) {
+                pointSize = true;
+                return;
+            }
             if (!input && value == spv::BuiltInPrimitivePointIndicesEXT) primitiveIndices = 1u;
             if (!input && value == spv::BuiltInPrimitiveLineIndicesEXT) primitiveIndices = 2u;
             if (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT) primitiveIndices = 3u;
@@ -149,6 +155,10 @@ struct Module {
             Require((value == spv::BuiltInVertexIndex || value == spv::BuiltInInstanceIndex || value == spv::BuiltInBaseInstance) && signature == "i32", "unsupported vertex built-in input");
         } else if (vertex && storage == spv::StorageClassOutput) {
             if (value == spv::BuiltInLayer && layerOutput && (signature == "u32" || signature == "i32")) return;
+            if (value == spv::BuiltInPointSize && pointSizeOutput && signature == "f32" && !pointSize) {
+                pointSize = true;
+                return;
+            }
             Require(value == spv::BuiltInPosition && signature == "f32x4" && !position, "unsupported or duplicate vertex built-in output");
             position = true;
         } else {
@@ -186,6 +196,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     Require(words[4] == 0, "unsupported SPIR-V schema: " + std::to_string(words[4]));
 
     Module module;
+    module.pointSizeOutput = (state.vertexPoints && stage == Stage::Vertex) || (mesh && state.stages.mesh.has_value() && state.stages.mesh->outputPrimitiveSize == 1u);
     std::uint32_t entries = 0;
     std::uint32_t memoryModels = 0;
     std::uint32_t entryPoint = 0;
