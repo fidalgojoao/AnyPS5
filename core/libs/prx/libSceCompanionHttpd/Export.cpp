@@ -1,3 +1,5 @@
+#include "prx/libSceCompanionHttpd/include/Api.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -15,16 +17,7 @@ constexpr int CompanionHttpdErrorAlreadyStarted = static_cast<int>(0x80E4000Au);
 constexpr int CompanionHttpdErrorNotStarted = static_cast<int>(0x80E4000Bu);
 constexpr int CompanionHttpdErrorAlreadyRegistered = static_cast<int>(0x80E4000Cu);
 
-struct CompanionHttpdOptParam {
-    std::uint64_t reserved;
-    void* workMemory;
-    std::uint64_t workMemorySize;
-    std::uint8_t settings[0x40];
-    const void* temporaryMountPoint;
-};
 static_assert(sizeof(CompanionHttpdOptParam) == 0x60);
-
-using CompanionHttpdRequestCallback = int (*)(int, int, const void*, void*, void*);
 
 struct CompanionHttpdState {
     std::mutex mutex;
@@ -45,7 +38,11 @@ extern "C" {
 
 int APS5_VABI sceCompanionHttpdOptParamInitialize(CompanionHttpdOptParam* param) {
     if (param == nullptr) return CompanionHttpdErrorInvalidParam;
-    std::memset(param, 0, sizeof(*param));
+    CompanionHttpdOptParam zero{};
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(param, &zero, sizeof(zero));
+    errno = savedErrno;
+    if (!copied) return CompanionHttpdErrorInvalidParam;
     return 0;
 }
 
@@ -117,47 +114,38 @@ int APS5_VABI sceCompanionHttpdGetEvent(void* event) {
 }
 
 int APS5_VABI sceCompanionHttpdAddHeader(const char* key, const char* value, void* response) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdSetStatus(int status, void* response) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdSetBody(const char* body, std::uint64_t size, void* response) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdGet2ndScreenStatus(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdGetUserId(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdInitialize2(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdRegisterRequestBodyReceptionCallback(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdRegisterRequestCallback2(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceCompanionHttpdUnregisterRequestBodyReceptionCallback(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
